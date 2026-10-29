@@ -1,0 +1,9 @@
+# Local memory database — contains private session memory, never commit
+db/
+
+# Node dependencies
+node_modules/
+
+# OS/editor cruft
+.DS_Store
+*.swp

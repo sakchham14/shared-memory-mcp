@@ -7,6 +7,8 @@ import { dirname } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 const DB_PATH = process.env.MEM_DB_PATH || '/Users/mochi/.claude/mem/db/mem.db';
+// Token threshold at which the active "clump" (chat batch) is sealed and a new one starts.
+const CLUMP_THRESHOLD = Number(process.env.MEM_CLUMP_THRESHOLD_TOKENS || 8000);
 mkdirSync(dirname(DB_PATH), { recursive: true });
 
 const db = new Database(DB_PATH);
@@ -34,11 +36,36 @@ CREATE TABLE IF NOT EXISTS change_log (
   summary TEXT NOT NULL,
   timestamp TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS clumps (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  summary TEXT,
+  token_estimate INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_clumps_project ON clumps(project_id);
 `);
 
 // Add content_zlib column to databases created before compression was introduced.
 try {
   db.exec('ALTER TABLE memories ADD COLUMN content_zlib BLOB');
+} catch (e) {
+  if (!/duplicate column/i.test(e.message)) throw e;
+}
+
+// Add clump_id column to databases created before clumps were introduced.
+try {
+  db.exec('ALTER TABLE memories ADD COLUMN clump_id TEXT');
+} catch (e) {
+  if (!/duplicate column/i.test(e.message)) throw e;
+}
+
+// Index on the new column (must run after the ALTER above, since CREATE INDEX
+// IF NOT EXISTS in node:sqlite does not tolerate a missing column).
+try {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memories_clump ON memories(clump_id)');
 } catch (e) {
   if (!/duplicate column/i.test(e.message)) throw e;
 }
@@ -49,6 +76,68 @@ const migrate = db.prepare('SELECT id, content FROM memories WHERE content_zlib 
 for (const row of migrate.all()) {
   db.prepare('UPDATE memories SET content_zlib = ? WHERE id = ?')
     .run(deflateSync(Buffer.from(row.content, 'utf8')), row.id);
+}
+
+// Assign every pre-clump memory to a single legacy clump so clump queries work.
+const hasClumpCol = db.prepare("PRAGMA table_info(memories)").all().some(c => c.name === 'clump_id');
+if (hasClumpCol) {
+  const unassigned = db.prepare('SELECT id FROM memories WHERE clump_id IS NULL').all();
+  if (unassigned.length) {
+    const legacyId = `clump_legacy_${Date.now()}`;
+    db.prepare('INSERT OR IGNORE INTO clumps (id, project_id, started_at, token_estimate) VALUES (?, ?, ?, ?)')
+      .run(legacyId, '__legacy__', new Date().toISOString(), 0);
+    const update = db.prepare('UPDATE memories SET clump_id = ? WHERE clump_id IS NULL');
+    db.exec('BEGIN');
+    for (const row of unassigned) update.run(legacyId);
+    db.exec('COMMIT');
+  }
+}
+
+// --- Clump helpers -----------------------------------------------------------
+
+// Rough token estimate: ~4 chars per token. Cheap, no model call.
+function estimateTokens(text) {
+  return Math.ceil((text || '').length / 4);
+}
+
+function activeClump(projectId) {
+  return db.prepare(
+    'SELECT * FROM clumps WHERE project_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1'
+  ).get(projectId);
+}
+
+function totalClumpTokens(clumpId) {
+  const row = db.prepare(
+    "SELECT COALESCE(SUM(length(title)+length(content)+length(summary)),0) as bytes FROM memories WHERE clump_id = ?"
+  ).get(clumpId);
+  return estimateTokensFromBytes(row.bytes);
+}
+
+function estimateTokensFromBytes(bytes) {
+  return Math.ceil((bytes || 0) / 4);
+}
+
+// Seal a clump: mark it ended, record a summary, and start a fresh one.
+// Returns { sealed, started }.
+function sealClump(projectId, summary = '') {
+  const active = activeClump(projectId);
+  if (!active) return { sealed: null, started: null };
+  db.prepare('UPDATE clumps SET ended_at = ?, summary = ?, token_estimate = ? WHERE id = ?')
+    .run(new Date().toISOString(), summary || `Clump sealed at threshold`, totalClumpTokens(active.id), active.id);
+  const newId = `clump_${projectId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  db.prepare('INSERT INTO clumps (id, project_id, started_at) VALUES (?, ?, ?)')
+    .run(newId, projectId, new Date().toISOString());
+  return { sealed: active.id, started: newId };
+}
+
+// Ensure a project has an active clump; create one if not.
+function ensureClump(projectId) {
+  const active = activeClump(projectId);
+  if (active) return active;
+  const id = `clump_${projectId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  db.prepare('INSERT INTO clumps (id, project_id, started_at) VALUES (?, ?, ?)')
+    .run(id, projectId, new Date().toISOString());
+  return db.prepare('SELECT * FROM clumps WHERE id = ?').get(id);
 }
 
 const server = new Server(
@@ -104,6 +193,63 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: { type: 'object', properties: {} },
       },
       {
+        name: 'get_project_index',
+        description:
+          'CHEAP project index for session start. Returns ONLY summaries and metadata — ' +
+          'never full content. Use this to load context with minimal tokens, then call ' +
+          'get_memory(id) for the verbatim content of anything you actually need.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'Project or conversation identifier' },
+            includeSealed: {
+              type: 'boolean',
+              description: 'Include summaries of sealed (past) clumps (default true)',
+              default: true,
+            },
+          },
+          required: ['projectId'],
+        },
+      },
+      {
+        name: 'get_clump',
+        description:
+          'Fetch the full verbatim content of every memory in a clump (chat batch). ' +
+          'Use to reconstruct a sealed conversation. Pass clumpId from get_project_index.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            clumpId: { type: 'string', description: 'Clump ID (from get_project_index)' },
+          },
+          required: ['clumpId'],
+        },
+      },
+      {
+        name: 'list_clumps',
+        description: 'List all clumps (chat batches) for a project, newest first.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'Project or conversation identifier' },
+          },
+          required: ['projectId'],
+        },
+      },
+      {
+        name: 'seal_clump',
+        description:
+          'Manually seal the active clump for a project and start a new one. ' +
+          'Use at the end of a chat batch to freeze it before context compaction.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'Project or conversation identifier' },
+            summary: { type: 'string', description: 'Optional summary of the sealed clump' },
+          },
+          required: ['projectId'],
+        },
+      },
+      {
         name: 'get_memory',
         description:
           'Fetch one memory by ID and return its EXACT, verbatim stored content. ' +
@@ -146,23 +292,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         INSERT INTO change_log (memory_id, project_id, action, summary, timestamp)
         VALUES (?, ?, 'UPDATE', ?, ?)
       `).run(id, projectId, summary || `Updated: ${title}`, now);
-    } else {
-      db.prepare(`
-        INSERT INTO memories (id, project_id, title, content, content_zlib, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, projectId, title, content, deflateSync(Buffer.from(content, 'utf8')), summary, now, now);
 
-      db.prepare(`
-        INSERT INTO change_log (memory_id, project_id, action, summary, timestamp)
-        VALUES (?, ?, 'CREATE', ?, ?)
-      `).run(id, projectId, summary || `Created: ${title}`, now);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: true, memoryId: id, projectId, action: 'updated' }),
+          },
+        ],
+      };
     }
+
+    // New memory: attach to the active clump, sealing it first if over threshold.
+    let clump = ensureClump(projectId);
+    const before = totalClumpTokens(clump.id);
+    const newTokens = estimateTokens(title + content + summary);
+    let sealed = null;
+    if (before + newTokens > CLUMP_THRESHOLD) {
+      const result = sealClump(projectId, `Auto-sealed after ${before + newTokens} estimated tokens`);
+      clump = db.prepare('SELECT * FROM clumps WHERE id = ?').get(result.started);
+      sealed = result.sealed;
+    }
+
+    db.prepare(`
+      INSERT INTO memories (id, project_id, title, content, content_zlib, summary, clump_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, projectId, title, content, deflateSync(Buffer.from(content, 'utf8')), summary, clump.id, now, now);
+
+    db.prepare(`
+      INSERT INTO change_log (memory_id, project_id, action, summary, timestamp)
+      VALUES (?, ?, 'CREATE', ?, ?)
+    `).run(id, projectId, summary || `Created: ${title}`, now);
 
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({ success: true, memoryId: id, projectId, action: existing ? 'updated' : 'created' }),
+          text: JSON.stringify({
+            success: true,
+            memoryId: id,
+            projectId,
+            action: 'created',
+            clumpId: clump.id,
+            clumpSealed: sealed,
+            clumpTokens: totalClumpTokens(clump.id),
+          }),
         },
       ],
     };
@@ -299,11 +473,150 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               compressedBytes: compressed.bytes,
               compressionRatio: raw.bytes ? (compressed.bytes / raw.bytes).toFixed(3) : 0,
               dbPath: DB_PATH,
+              clumpThresholdTokens: CLUMP_THRESHOLD,
               byProject,
             },
             null,
             2,
           ),
+        },
+      ],
+    };
+  }
+
+  if (name === 'get_project_index') {
+    const { projectId, includeSealed = true } = args;
+    const activeClumpRow = activeClump(projectId);
+    const activeMemories = activeClumpRow
+      ? db.prepare(`
+          SELECT id, title, summary, clump_id, updated_at
+          FROM memories WHERE project_id = ? AND clump_id = ?
+          ORDER BY updated_at DESC
+        `).all(projectId, activeClumpRow.id)
+      : [];
+
+    const clumps = db.prepare(
+      'SELECT id, started_at, ended_at, summary, token_estimate FROM clumps WHERE project_id = ? ORDER BY started_at DESC'
+    ).all(projectId);
+
+    const sealedSummaries = includeSealed
+      ? clumps
+          .filter(c => c.ended_at && c.id !== (activeClumpRow ? activeClumpRow.id : null))
+          .map(c => ({
+            clumpId: c.id,
+            startedAt: c.started_at,
+            endedAt: c.ended_at,
+            summary: c.summary,
+            tokenEstimate: c.token_estimate,
+            memoryCount: db.prepare('SELECT COUNT(*) as n FROM memories WHERE clump_id = ?').get(c.id).n,
+          }))
+      : [];
+
+    const activeClumpObj = activeClumpRow
+      ? {
+          clumpId: activeClumpRow.id,
+          startedAt: activeClumpRow.started_at,
+          tokenEstimate: totalClumpTokens(activeClumpRow.id),
+          memoryCount: activeMemories.length,
+          memories: activeMemories,
+        }
+      : null;
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              projectId,
+              activeClump: activeClumpObj,
+              sealedClumps: sealedSummaries,
+              totalMemories: activeMemories.length + sealedSummaries.reduce((s, c) => s + c.memoryCount, 0),
+              totalClumps: clumps.length,
+              note: 'This index contains summaries only. Call get_memory(id) for verbatim content.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  if (name === 'get_clump') {
+    const { clumpId } = args;
+    const clump = db.prepare('SELECT * FROM clumps WHERE id = ?').get(clumpId);
+    if (!clump) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: `Clump not found: ${clumpId}` }) }],
+      };
+    }
+    const memories = db.prepare(
+      'SELECT id, title, content, summary, clump_id, created_at, updated_at FROM memories WHERE clump_id = ? ORDER BY created_at ASC'
+    ).all(clumpId);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              clump,
+              memoryCount: memories.length,
+              memories,
+              note: 'Full verbatim content of every memory in this clump.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  if (name === 'list_clumps') {
+    const { projectId } = args;
+    const rows = db.prepare(
+      'SELECT id, started_at, ended_at, summary, token_estimate FROM clumps WHERE project_id = ? ORDER BY started_at DESC'
+    ).all(projectId);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              projectId,
+              clumps: rows.map(r => ({
+                ...r,
+                memoryCount: db.prepare('SELECT COUNT(*) as n FROM memories WHERE clump_id = ?').get(r.id).n,
+                isActive: !r.ended_at,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  if (name === 'seal_clump') {
+    const { projectId, summary = '' } = args;
+    const result = sealClump(projectId, summary);
+    if (!result.sealed) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: `No active clump for project: ${projectId}` }) }],
+      };
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            sealedClumpId: result.sealed,
+            newActiveClumpId: result.started,
+            projectId,
+          }),
         },
       ],
     };

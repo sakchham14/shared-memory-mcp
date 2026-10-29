@@ -47,7 +47,51 @@ so this is a non-issue for years. `VACUUM` reclaims free pages if needed.
 | `get_project_summary(projectId)` | All memories + change history for a project |
 | `list_projects()` | All projects with memory counts |
 | `get_memory(id)` | **Verbatim** full content of one memory |
+| `get_project_index(projectId, includeSealed?)` | **Cheap index** — summaries + metadata only, never full content. Use at session start |
+| `list_clumps(projectId)` | All clumps (chat batches) for a project, newest first |
+| `get_clump(clumpId)` | **Verbatim** full content of every memory in a clump |
+| `seal_clump(projectId, summary?)` | Seal the active clump and start a new one |
 | `memory_stats()` | Storage stats: count, raw vs compressed bytes, per-project breakdown |
+
+## Clumps (chat batches)
+
+Memories are grouped into **clumps** — a running chat batch. When the estimated
+token total of the active clump exceeds `MEM_CLUMP_THRESHOLD_TOKENS`
+(default 8000), the next `save_memory` **auto-seals** it and starts a fresh one.
+Sealed clumps keep their summary and are reconstructable via `get_clump`.
+
+- **Auto-rollover:** `save_memory` returns `clumpSealed` (the id of the clump
+  that was just sealed) and `clumpId` (the clump the new memory landed in).
+- **Manual seal:** `seal_clump(projectId, summary)` — call it at the end of a
+  chat batch to freeze it before context compaction.
+- **Reconstruct:** `get_clump(clumpId)` returns every memory in a clump,
+  verbatim, in creation order.
+
+```text
+save_memory("my-project", "decision", "full content...", "one-line summary")
+  → { clumpId: "clump_...", clumpSealed: "clump_..." | null }
+get_project_index("my-project")   → cheap summaries, for session start
+get_clump("clump_...")            → full content of a sealed batch
+```
+
+## Session-start hook
+
+`session-start.js` runs on every Claude Code `SessionStart` (registered in
+`~/.claude/settings.json`) and injects a **compact index** into context:
+active-clump summaries, sealed-clump summaries, and other projects. It never
+loads full memory content — that's fetched on demand via `get_memory(id)`,
+keeping the session-start cost to a few hundred tokens.
+
+Override the project id per session with `MEM_PROJECT_ID=<name>`.
+
+## Usage pattern
+
+```text
+1. On session start:  get_project_index("my-project")  → cheap context
+2. When asked a fact: get_memory(id)                   → verbatim answer
+3. When something is decided: save_memory(...)          → persists for next session
+4. At end of a batch:  seal_clump("my-project")        → freeze before compaction
+```
 
 ### Verbatim fetch — the anti-hallucination guarantee
 
