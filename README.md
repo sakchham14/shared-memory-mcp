@@ -84,6 +84,35 @@ keeping the session-start cost to a few hundred tokens.
 
 Override the project id per session with `MEM_PROJECT_ID=<name>`.
 
+## Autosave (Stop hook)
+
+`prompt-stage.js` + `session-end.js` pair up to **save every turn
+automatically** — no agent instruction needed:
+
+1. `prompt-stage.js` (UserPromptSubmit) stages each prompt to
+   `~/.claude/mem/staging/<projectId>.jsonl`, capped at 25 entries.
+2. `session-end.js` (Stop) pairs the latest staged prompt with the assistant's
+   last message and writes one memory per turn **directly to SQLite** — no MCP
+   server, no model call, **zero tokens**. It auto-seals clumps at the
+   threshold and clears the consumed staging entry.
+
+Disable per session with `MEM_AUTOSAVE=0`.
+
+## Keyword recall (UserPromptSubmit hook)
+
+`recall.js` runs on every prompt and **only pulls memories the prompt actually
+references** — the "few 100 paths, find the full chat" pattern:
+
+1. Extracts keywords from the prompt (lowercased, stopword-filtered, capped at
+   12).
+2. Searches title/content/summary in the shared DB, scoped to the project,
+   ranked by keyword hits then recency, capped at 8.
+3. Injects a compact block: title + ≤400-char snippet + `[id:...]`.
+4. The agent calls `get_memory(id)` for verbatim text **only when it needs it**.
+
+A long project costs a few hundred tokens at most. Set `MEM_RECALL_MAX`,
+`MEM_RECALL_CHARS`, `MEM_RECALL_MIN_LEN` to tune.
+
 ## Usage pattern
 
 ```text
@@ -91,6 +120,8 @@ Override the project id per session with `MEM_PROJECT_ID=<name>`.
 2. When asked a fact: get_memory(id)                   → verbatim answer
 3. When something is decided: save_memory(...)          → persists for next session
 4. At end of a batch:  seal_clump("my-project")        → freeze before compaction
+5. Autosave:          prompt-stage + session-end hooks   → automatic per-turn
+6. Recall:            recall.js hook                     → keyword-targeted only
 ```
 
 ### Verbatim fetch — the anti-hallucination guarantee
@@ -151,14 +182,6 @@ all SQLite builds).
   The BLOB is only read when you fetch a specific memory verbatim.
 - **WAL journaling** for safe concurrent reads.
 - **Change log** tracks every create/update per project.
-
-## Usage pattern
-
-```text
-1. On session start:  get_project_summary("my-project")  → real context
-2. When asked a fact: get_memory(id)                     → verbatim answer
-3. When something is decided: save_memory(...)           → persists for next session
-```
 
 ## Notes
 

@@ -1,6 +1,9 @@
 # Local memory database — contains private session memory, never commit
 db/
 
+# Staged prompts awaiting autosave (private session data)
+staging/
+
 # Node dependencies
 node_modules/
 

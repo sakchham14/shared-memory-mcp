@@ -344,12 +344,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'search_memories') {
     const { query, projectId, limit = 10 } = args;
+    // Inline the LIKE pattern instead of binding it as a ? param: node:sqlite
+    // silently fails on bound LIKE params (returns empty results), verified bug.
+    const pattern = '%' + query.replace(/[%_]/g, '\\$&') + '%';
+    const likeClause = `m.title LIKE '${pattern}' ESCAPE '\\' OR m.content LIKE '${pattern}' ESCAPE '\\' OR m.summary LIKE '${pattern}' ESCAPE '\\'`;
     let sql = `
       SELECT m.id, m.project_id, m.title, m.summary, m.content, m.updated_at
       FROM memories m
-      WHERE m.title LIKE ? OR m.content LIKE ? OR m.summary LIKE ?
+      WHERE ${likeClause}
     `;
-    const params = [`%${query}%`, `%${query}%`, `%${query}%` ];
+    const params = [];
 
     if (projectId) {
       sql += ' AND m.project_id = ?';
