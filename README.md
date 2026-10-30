@@ -113,6 +113,54 @@ references** — the "few 100 paths, find the full chat" pattern:
 A long project costs a few hundred tokens at most. Set `MEM_RECALL_MAX`,
 `MEM_RECALL_CHARS`, `MEM_RECALL_MIN_LEN` to tune.
 
+### Recall quality gates (fixes hallucination + looping)
+
+Without gates, **any** single keyword match injects a memory — including stale,
+off-topic rows from other conversations. The model then re-answers its own past
+text and loops. Verified before the fix: a generic prompt returned 8 memories,
+most unrelated to the actual request.
+
+`recall.js` now applies post-filter gates (all env-tunable, defaults safe):
+
+| Gate | Default | What it rejects |
+|---|---|---|
+| `MEM_RECALL_MIN_HIT_SHARE` | 0.5 | rows matching <50% of the prompt's keywords |
+| `MEM_RECALL_MAX_AGE_DAYS` | 90 | rows older than the cutoff |
+| `MEM_RECALL_MATCH_ALL_RATIO` | 0.9 | rows matching *all* keywords (generic meta-rows) |
+| — | — | raw JSON hook envelopes (`{"session_id"...`) |
+| — | — | `<pasted_content>` blobs |
+| — | — | bodies that are predominantly non-Latin-script (embedding model is English-only) |
+
+Empty-prompt rows (`User: (no staged prompt)`) hold real assistant knowledge but
+lack a query anchor, so they are **down-ranked in SQL, not dropped**. Candidate
+fetch is `RECALL_MAX × 4` so the LIMIT doesn't discard everything before the age
+filter runs.
+
+**Measured savings** — same 5 prompts, before (pre-cleanup DB, gates off) vs.
+after (live DB, gates on):
+
+| Prompt | Before | After | Saved |
+|---|---|---|---|
+| "access local claude memory… hallucinate and looping" | 1,731 chars / 8 memories | 550 chars / 1 memory | **−68%** |
+| "remaining tasks for the hybrid search engine" | 1,702 / 8 | 881 / 3 | −48% |
+| "how does the autosave stop hook work" | 1,672 / 8 | 965 / 4 | −42% |
+| "freellmapi gateway proxy api key setup" | 1,682 / 8 | 682 / 2 | −60% |
+| "what is the weather today" | 199 / 0 | 136 / 0 | −32% |
+| **Total** | **6,986 chars** | **3,214 chars** | **−54%** |
+
+At ~4 chars/token that is ~349 → ~161 tokens per prompt, **~188 tokens saved on
+every prompt**. But the larger win is correctness: off-topic injection is what
+drove the loop, so the real cost was the repeated full-context re-sends, not the
+recall block itself.
+
+`mem_prune.js` removes rows that can never be useful (raw envelopes, pasted
+transcripts, non-Latin-script bodies). Run with `--dry-run` first:
+
+```bash
+node mem_prune.js /path/to/mem.db my-project --dry-run
+node mem_prune.js /path/to/mem.db my-project
+```
+
 ## Usage pattern
 
 ```text
