@@ -1,0 +1,17 @@
+# Database — contains private session memory, never commit
+data/
+*.db
+*.db.backup-*
+
+# Node dependencies
+node_modules/
+
+# Cache
+cache/
+
+# Project-specific memory caches
+projects/
+
+# OS/editor cruft
+.DS_Store
+*.swp
