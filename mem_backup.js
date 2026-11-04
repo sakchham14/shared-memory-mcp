@@ -10,12 +10,22 @@
 import { copyFileSync, readdirSync, statSync, unlinkSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 
-const dbPath = process.argv[2];
-const backupDir = process.argv[3] || `${homedir()}/code/.claude/mem/data/backups`;
+import { existsSync } from 'node:fs';
+
+const defaultDbCandidates = [
+  `${homedir()}/.claude/mem/data/mem.db`,
+  `${homedir()}/.claude/mem/db/mem.db`,
+];
+const dbPath = process.argv[2] || defaultDbCandidates.find(p => existsSync(p));
+const backupDir = process.argv[3] || `${homedir()}/.claude/mem/data/backups`;
 const retentionDays = Number(process.argv[4] || process.env.MEM_BACKUP_RETENTION_DAYS || 30);
 if (!dbPath) {
-  console.error('usage: node mem_backup.js <db_path> [backup_dir] [retention_days]');
-  process.exit(2);
+  // No DB present on this machine; nothing to back up. Exit cleanly so the
+  // Stop hook does not report a failure.
+  process.exit(0);
+}
+if (!existsSync(dbPath)) {
+  process.exit(0);
 }
 
 mkdirSync(backupDir, { recursive: true });
