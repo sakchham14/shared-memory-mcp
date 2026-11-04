@@ -29,15 +29,20 @@ A small SQLite-backed memory layer that injects only **summaries** into Claude C
 └── projects/          # Per-project memory caches (gitignored)
 ```
 
+## Install / Update (one-liner)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sakchham14/shared-memory-mcp/main/install.sh | bash
+```
+
+- First run: clones the repo into `~/.claude/mem`, installs npm deps, and preserves any existing `data/`/`db/` directories.
+- Subsequent runs: `git pull --ff-only` + `npm install` to pull the latest changes.
+
+Override the install location with `SHARED_MEM_DIR=/path/to/dir`.
+
 ## Setup
 
-1. **Install dependencies**
-   ```bash
-   cd ~/.claude/mem
-   npm install
-   ```
-
-2. **Configure Claude Code hooks** in `~/.claude/settings.json`:
+1. **Configure Claude Code hooks** in `~/.claude/settings.json`:
    ```json
    {
      "hooks": {
@@ -48,7 +53,7 @@ A small SQLite-backed memory layer that injects only **summaries** into Claude C
        ],
        "Stop": [
          { "hooks": [
-           { "type": "command", "command": "node ~/.claude/mem/mem_backup.js ~/.claude/mem/data/mem.db", "timeout": 5000 },
+           { "type": "command", "command": "node ~/.claude/mem/mem_backup.js", "timeout": 5000 },
            { "type": "command", "command": "node ~/.claude/mem/session-end.js", "timeout": 5000 }
          ]}
        ],
@@ -68,7 +73,9 @@ A small SQLite-backed memory layer that injects only **summaries** into Claude C
    }
    ```
 
-3. **Restart Claude Code** — the SessionStart hook will inject the compact index automatically.
+   `mem_backup.js` auto-detects the DB file (`~/.claude/mem/data/mem.db` or `~/.claude/mem/db/mem.db`) and exits cleanly when none is present, so it is safe on fresh machines.
+
+2. **Restart Claude Code** — the SessionStart hook will inject the compact index automatically.
 
 ## Usage
 
