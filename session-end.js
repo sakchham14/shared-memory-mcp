@@ -145,7 +145,66 @@ db.prepare(`
   VALUES (?, ?, 'CREATE', ?, ?)
 `).run(id, PROJECT_ID, secrets.length ? `Saved with ${secrets.length} redaction(s)` : summary, now);
 
-// --- Clear staging for the saved turn ---
+// --- Structured fact auto-capture (heuristic, zero tokens) ---
+// Extract decision/note/todo/constraint lines from the assistant message and
+// save each as a separate 'fact' memory so they are retrievable later.
+const factPatterns = [
+  /\b(?:Decision|Decided|Conclusion|Result|Outcome|Constraint|Rule|Note|TODO|Action item|Next step)s?\s*[:\-]\s*(.+)/gi,
+];
+const facts = new Set();
+for (const re of factPatterns) {
+  let m;
+  while ((m = re.exec(assistantMsg)) !== null) {
+    const fact = m[1].trim().slice(0, 500);
+    if (fact.length > 10) facts.add(fact);
+  }
+}
+
+function saveFact(text) {
+  const fid = `fact_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const fnow = new Date().toISOString();
+  let fclump = ensureClump(PROJECT_ID);
+  const fbefore = totalClumpTokens(fclump.id);
+  const fnew = Math.ceil(text.length / 4);
+  if (fbefore + fnew > CLUMP_THRESHOLD) {
+    const active = fclump;
+    db.prepare('UPDATE clumps SET ended_at = ?, summary = ?, token_estimate = ? WHERE id = ?')
+      .run(new Date().toISOString(), `Auto-sealed after ${fbefore + fnew} est tokens`, totalClumpTokens(active.id), active.id);
+    const newId = `clump_${PROJECT_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    db.prepare('INSERT INTO clumps (id, project_id, started_at) VALUES (?, ?, ?)').run(newId, PROJECT_ID, new Date().toISOString());
+    fclump = db.prepare('SELECT * FROM clumps WHERE id = ?').get(newId);
+  }
+  const { text: fcontent, secrets: fsecrets } = redact(text);
+  db.prepare(`
+    INSERT INTO memories (id, project_id, title, content, content_zlib, summary, memory_type, pinned, redaction, clump_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(fid, PROJECT_ID, `Fact: ${text.slice(0, 60)}`, fcontent, deflateSync(Buffer.from(fcontent, 'utf8')), text.slice(0, 120), 'fact', 0, fsecrets.length ? JSON.stringify(fsecrets) : null, fclump.id, fnow, fnow);
+  db.prepare(`INSERT INTO change_log (memory_id, project_id, action, summary, timestamp) VALUES (?, ?, 'CREATE', ?, ?)`).run(fid, PROJECT_ID, `Auto-captured fact`, fnow);
+  return fid;
+}
+
+const capturedFactIds = [];
+for (const f of facts) capturedFactIds.push(saveFact(f));
+
+// --- Project briefing memory (auto-maintained, always available) ---
+// Maintain a single 'briefing' memory per project summarizing recent activity.
+const briefingTitle = 'Project briefing';
+const existingBriefing = db.prepare("SELECT id FROM memories WHERE project_id = ? AND memory_type = 'reference' AND title = ?").get(PROJECT_ID, briefingTitle);
+const briefingContent = `Auto-maintained briefing for project "${PROJECT_ID}".\nLast turn: ${new Date().toISOString()}\nRecent facts captured: ${capturedFactIds.length}\nLast assistant summary: ${assistantMsg.slice(0, 300)}`;
+const bnow = new Date().toISOString();
+if (existingBriefing) {
+  db.prepare(`UPDATE memories SET content = ?, content_zlib = ?, summary = ?, updated_at = ? WHERE id = ?`)
+    .run(briefingContent, deflateSync(Buffer.from(briefingContent, 'utf8')), `Briefing updated ${bnow}`, bnow, existingBriefing.id);
+} else {
+  const bid = `briefing_${PROJECT_ID}`;
+  let bclump = ensureClump(PROJECT_ID);
+  db.prepare(`
+    INSERT INTO memories (id, project_id, title, content, content_zlib, summary, memory_type, pinned, redaction, clump_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(bid, PROJECT_ID, briefingTitle, briefingContent, deflateSync(Buffer.from(briefingContent, 'utf8')), `Briefing updated ${bnow}`, 'reference', 0, null, bclump.id, bnow, bnow);
+  db.prepare(`INSERT INTO change_log (memory_id, project_id, action, summary, timestamp) VALUES (?, ?, 'CREATE', ?, ?)`).run(bid, PROJECT_ID, 'Briefing created', bnow);
+}
+// --- end auto-capture ---
 try {
   if (staged.length <= 1) {
     unlinkSync(stagingFile);

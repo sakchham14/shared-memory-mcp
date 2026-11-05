@@ -48,7 +48,7 @@ if (activeClump) {
   const memories = db.prepare(
     `SELECT id, title, summary, updated_at
      FROM memories WHERE project_id = ? AND clump_id = ?
-     ORDER BY updated_at DESC LIMIT ?`
+     ORDER BY id ASC LIMIT ?`
   ).all(PROJECT_ID, activeClump.id, INDEX_LIMIT);
   const count = db.prepare(
     'SELECT COUNT(*) as n FROM memories WHERE project_id = ? AND clump_id = ?'
@@ -76,7 +76,7 @@ const sealed = db.prepare(
           (SELECT COUNT(*) FROM memories m WHERE m.clump_id = c.id) as n
    FROM clumps c
    WHERE c.project_id = ? AND c.ended_at IS NOT NULL
-   ORDER BY c.started_at DESC LIMIT 5`
+   ORDER BY c.id ASC LIMIT 5`
 ).all(PROJECT_ID);
 
 if (sealed.length) {

@@ -37,7 +37,8 @@ const PATTERNS = [
   [/xox[baprs]-[A-Za-z0-9-]{10,}/g, 'slack_token'],
   [/Bearer\s+[A-Za-z0-9._~+/=-]{20,}/g, 'bearer_token'],
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, 'private_key'],
-  // `password = value`, `api_key: value`, `token=value`, `secret: value`
+  [/\/(?:Users|home|root)\/[^\s'"]{6,}/g, 'filesystem_path'],
+  [/\/(?:etc|var|tmp)\/[^\s'"]{6,}/g, 'filesystem_path'],
   [
     /(password|passwd|pwd|api[_-]?key|secret|auth[_-]?token|access[_-]?token|client[_-]?secret)\s*[:=]\s*['"]?([^\s'"]{8,})['"]?/gi,
     'credential_assignment',

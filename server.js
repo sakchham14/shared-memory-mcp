@@ -5,6 +5,7 @@ import { Database } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { embed, cosine, getCached, saveCacheEntry } from './embed.js';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 const DB_PATH = process.env.MEM_DB_PATH || `${homedir()}/code/.claude/mem/data/mem.db`;
@@ -141,8 +142,15 @@ function estimateTokensFromBytes(bytes) {
 function sealClump(projectId, summary = '') {
   const active = activeClump(projectId);
   if (!active) return { sealed: null, started: null };
+  // Hierarchical summary: if none provided, build from sealed clump's memories.
+  let finalSummary = summary;
+  if (!finalSummary) {
+    const mems = db.prepare('SELECT title, summary FROM memories WHERE clump_id = ?').all(active.id);
+    const parts = mems.map(m => m.summary ? `${m.title}: ${m.summary}` : m.title).join(' | ');
+    finalSummary = `Sealed clump (${mems.length} memories): ${parts.slice(0, 400)}`;
+  }
   db.prepare('UPDATE clumps SET ended_at = ?, summary = ?, token_estimate = ? WHERE id = ?')
-    .run(new Date().toISOString(), summary || `Clump sealed at threshold`, totalClumpTokens(active.id), active.id);
+    .run(new Date().toISOString(), finalSummary, totalClumpTokens(active.id), active.id);
   const newId = `clump_${projectId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   db.prepare('INSERT INTO clumps (id, project_id, started_at) VALUES (?, ?, ?)')
     .run(newId, projectId, new Date().toISOString());
@@ -402,8 +410,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'search_memories') {
     const { query, projectId, limit = 10 } = args;
-    // Inline the LIKE pattern instead of binding it as a ? param: node:sqlite
-    // silently fails on bound LIKE params (returns empty results), verified bug.
     const pattern = '%' + query.replace(/[%_]/g, '\\$&') + '%';
     const likeClause = `m.title LIKE '${pattern}' ESCAPE '\\' OR m.content LIKE '${pattern}' ESCAPE '\\' OR m.summary LIKE '${pattern}' ESCAPE '\\'`;
     let sql = `
@@ -418,14 +424,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       params.push(projectId);
     }
     sql += ' ORDER BY m.updated_at DESC LIMIT ?';
-    params.push(limit);
+    params.push(Math.max(limit * 4, limit));
 
-    const rows = db.prepare(sql).all(...params);
+    const likeRows = db.prepare(sql).all(...params);
+
+    // Hybrid: also rank by embedding cosine similarity against ALL memories
+    // (not just LIKE hits) so semantic matches surface even without keyword overlap.
+    const qVec = await embed(query).catch(() => null);
+    let semanticRows = [];
+    if (qVec) {
+      const allSql = projectId
+        ? 'SELECT id, project_id, title, summary, content, updated_at FROM memories WHERE project_id = ?'
+        : 'SELECT id, project_id, title, summary, content, updated_at FROM memories';
+      const allParams = projectId ? [projectId] : [];
+      const allRows = db.prepare(allSql).all(...allParams);
+      semanticRows = allRows.map(r => {
+        const cached = getCached(r.id, (r.title || '') + ' ' + (r.summary || '') + ' ' + (r.content || ''));
+        // fall back to computing on demand
+        return { row: r, cached };
+      });
+      // compute embeddings on demand for rows lacking cache (best-effort, capped)
+      const scored = [];
+      for (const { row, cached } of semanticRows) {
+        let v = cached;
+        if (!v) {
+          try { v = await embed((row.title || '') + ' ' + (row.summary || '') + ' ' + (row.content || '')); }
+          catch { v = null; }
+          if (v) saveCacheEntry(row.id, v, (row.title || '') + ' ' + (row.summary || '') + ' ' + (row.content || ''));
+        }
+        const sim = v ? cosine(qVec, v) : 0;
+        if (sim >= 0.25) scored.push({ ...row, _sim: sim });
+      }
+      scored.sort((a, b) => b._sim - a._sim);
+      semanticRows = scored.slice(0, limit);
+    }
+
+    // Merge: LIKE hits first (keyword), then semantic-only hits, dedup by id, cap at limit.
+    const seen = new Set();
+    const merged = [];
+    for (const r of likeRows) { if (!seen.has(r.id)) { seen.add(r.id); merged.push(r); } }
+    for (const r of semanticRows) { if (!seen.has(r.id)) { seen.add(r.id); const { _sim, ...rest } = r; merged.push(rest); } }
+    const rows = merged.slice(0, limit);
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({ count: rows.length, results: rows }, null, 2),
+          text: JSON.stringify({ count: rows.length, results: rows, hybrid: !!qVec }, null, 2),
         },
       ],
     };
